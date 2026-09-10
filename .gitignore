@@ -1,0 +1,25 @@
+node_modules/
+.next/
+.env
+.env.*
+!.env.example
+
+# Local/private project notes
+PROJECT_PROGRESS.md
+
+# Credentials and private keys
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
+secrets.json
+*.secret
+*.token
+.secrets/
+__pycache__/
+.pytest_cache/
+*.pyc
+.venv/
+postgres-data/
+redis-data/

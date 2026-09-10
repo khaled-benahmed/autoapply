@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PFEBookExtraction",
+  "type": "object",
+  "required": ["company", "subjects"],
+  "properties": {
+    "company": {
+      "type": "object",
+      "required": ["name", "intro", "mission", "vision", "values"],
+      "properties": {
+        "name": { "type": ["string", "null"] },
+        "intro": { "type": ["string", "null"] },
+        "mission": { "type": ["string", "null"] },
+        "vision": { "type": ["string", "null"] },
+        "values": { "type": "array", "items": { "type": "string" } }
+      },
+      "additionalProperties": false
+    },
+    "subjects": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["title", "rawText"],
+        "properties": {
+          "title": { "type": "string" },
+          "rawText": { "type": "string" },
+          "pageStart": { "type": ["integer", "null"], "minimum": 1 },
+          "pageEnd": { "type": ["integer", "null"], "minimum": 1 }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}
