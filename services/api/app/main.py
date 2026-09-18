@@ -7,7 +7,7 @@ from fastapi import FastAPI, File, HTTPException, Response, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from .book_extraction import BookExtraction, OpenRouterExtractionProvider
+from .book_extraction import BookExtraction, G4FExtractionProvider, NVIDIAExtractionProvider
 from .book_repository import BookRecord, BookRepository, PostgresBookRepository
 from .config import settings
 from .pdf_extraction import extract_pdf
@@ -112,10 +112,25 @@ async def upload_book(response: Response, file: UploadFile = File(...)) -> Uploa
 
 @app.post("/books/{file_hash}/extract", response_model=ExtractionResponse)
 def extract_book(file_hash: str) -> ExtractionResponse:
-    if not settings.openrouter_api_key:
+    if settings.extraction_provider == "g4f":
+        provider = G4FExtractionProvider(
+            model=settings.g4f_model,
+            provider=settings.g4f_provider,
+            chunk_characters=settings.g4f_chunk_characters,
+        )
+    elif settings.extraction_provider == "nvidia" and settings.nvidia_api_key:
+        provider = NVIDIAExtractionProvider(
+            api_key=settings.nvidia_api_key,
+            model=settings.nvidia_model,
+            base_url=settings.nvidia_base_url,
+            timeout_seconds=settings.nvidia_timeout_seconds,
+            max_tokens=settings.nvidia_max_tokens,
+            max_retries=settings.nvidia_max_retries,
+        )
+    else:
         raise HTTPException(
             status_code=503,
-            detail="OpenRouter extraction is not configured; set OPENROUTER_API_KEY",
+            detail="Extraction provider is not configured; use EXTRACTION_PROVIDER=g4f or set NVIDIA_API_KEY",
         )
 
     book = book_repository.get_by_hash(file_hash)
@@ -123,10 +138,7 @@ def extract_book(file_hash: str) -> ExtractionResponse:
         raise HTTPException(status_code=404, detail="Book not found")
 
     try:
-        extraction = OpenRouterExtractionProvider(
-            api_key=settings.openrouter_api_key,
-            model=settings.openrouter_model,
-        ).extract(book.extracted_text, book.page_count)
+        extraction = provider.extract(book.extracted_text, book.page_count)
         book_repository.save_extraction(file_hash, extraction.model_dump_json())
     except Exception as error:
         raise HTTPException(

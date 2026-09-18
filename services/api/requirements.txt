@@ -8,3 +8,4 @@ boto3==1.35.63
 PyMuPDF==1.24.14
 pytesseract==0.3.13
 Pillow==11.0.0
+g4f==8.5.1

@@ -139,17 +139,31 @@ The system should support both self-hosted and free-tier cloud providers through
 - multilingual and lightweight enough for laptop use
 - can provide dense and sparse signals for hybrid search
 
-### OpenRouter free-model extraction
+### NVIDIA NIM extraction
 
-The current extraction implementation uses OpenRouter with `minimax/minimax-m3:free` for company context and subject segmentation. Subjects retain their complete `rawText`, title, and page range so embeddings and keyword search do not depend on perfect field classification. The extraction endpoint is called separately after upload:
+The current extraction implementation uses NVIDIA NIM with `nvidia/nemotron-3.5-lightning-30b-a3b` for company context and subject segmentation. Subjects retain their complete `rawText`, title, and page range so embeddings and keyword search do not depend on perfect field classification. The extraction endpoint is called separately after upload:
 
 ```powershell
-$env:OPENROUTER_API_KEY = "your-key-from-openrouter"
-$env:OPENROUTER_MODEL = "minimax/minimax-m3:free"
+$env:NVIDIA_API_KEY = "your-key-from-build.nvidia.com"
+$env:NVIDIA_MODEL = "nvidia/nemotron-3.5-lightning-30b-a3b"
+$env:NVIDIA_TIMEOUT_SECONDS = "180"
 docker compose up --build
 ```
 
-Then call `POST /books/{file_hash}/extract`. Do not commit API keys or place them in source files. OpenRouter free models can have availability and rate limits that change over time.
+Then call `POST /books/{file_hash}/extract`. Do not commit API keys or place them in source files. NVIDIA model availability and rate limits can change over time.
+
+### g4f extraction
+
+The API can use the community-maintained `g4f` client through its provider abstraction. It is selected by default for local experiments:
+
+```powershell
+$env:EXTRACTION_PROVIDER = "g4f"
+$env:G4F_PROVIDER = "LLM7"
+$env:G4F_MODEL = "default"
+docker compose up --build
+```
+
+g4f routes requests through third-party providers whose availability, speed, login requirements, and terms can change. It may require browser automation or provider-specific cookies. The application still validates the returned text against the Pydantic extraction schema before saving it. To use NVIDIA instead, set `EXTRACTION_PROVIDER=nvidia` and provide `NVIDIA_API_KEY`.
 
 
 ## Core data model

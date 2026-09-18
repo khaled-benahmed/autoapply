@@ -10,7 +10,28 @@ logger = logging.getLogger(__name__)
 
 
 def terminal_trace(label: str, value: Any) -> None:
-    print(f"[OpenRouter:{label}] {value}", flush=True)
+    print(f"[NVIDIA:{label}] {value}", flush=True)
+
+
+def extraction_system_prompt() -> str:
+    return (
+        "ROLE: You are a document extraction service for PFE internship catalogs.\n"
+        "TASK: Convert the supplied catalog text into the exact JSON object described below.\n"
+        "CONSTRAINTS:\n"
+        "- Return only one valid JSON object.\n"
+        "- Do not return markdown, code fences, explanations, reasoning, or commentary.\n"
+        "- Use exactly these top-level keys: company and subjects.\n"
+        "- Use exactly these company keys: name, intro, mission, vision, values.\n"
+        "- Use exactly these subject keys: title, rawText, pageStart, pageEnd.\n"
+        "- Do not rename, add, or remove keys.\n"
+        "- Use null for unknown pageStart or pageEnd. Use [] for unknown values.\n"
+        "- Preserve the complete subject text in rawText, including skills, location, and contacts.\n"
+        "- Do not invent information.\n"
+        "OUTPUT FORMAT:\n"
+        '{"company":{"name":null,"intro":null,"mission":null,"vision":null,"values":[]},'
+        '"subjects":[{"title":"...","rawText":"...","pageStart":null,"pageEnd":null}]}\n'
+        "Return the JSON object now."
+    )
 
 
 class CompanyExtraction(BaseModel):
@@ -51,7 +72,7 @@ def parse_provider_response(response_text: Any) -> BookExtraction:
             for item in response_text
         )
     if not isinstance(response_text, str) or not response_text.strip():
-        raise ValueError("OpenRouter returned an empty message content")
+        raise ValueError("NVIDIA returned an empty message content")
     response_text = response_text.strip()
     decoder = json.JSONDecoder()
     validation_error: ValidationError | None = None
@@ -66,7 +87,7 @@ def parse_provider_response(response_text: Any) -> BookExtraction:
                 validation_error = error
     if validation_error:
         raise validation_error
-    raise ValueError("OpenRouter response did not contain a JSON object")
+    raise ValueError("NVIDIA response did not contain a JSON object")
 
 
 def normalize_provider_payload(payload: Any) -> BookExtraction:
@@ -76,10 +97,16 @@ def normalize_provider_payload(payload: Any) -> BookExtraction:
             subjects=[_normalize_subject(item) for item in payload],
         )
     if not isinstance(payload, dict):
-        raise ValueError("OpenRouter returned a non-object extraction")
+        raise ValueError("NVIDIA returned a non-object extraction")
 
     if "company" in payload and "subjects" in payload:
         return BookExtraction.model_validate(payload)
+
+    if "internships" in payload and isinstance(payload["internships"], list):
+        return BookExtraction(
+            company=CompanyExtraction(intro=str(payload.get("companyContext", ""))),
+            subjects=[_normalize_subject(item) for item in payload["internships"]],
+        )
 
     if "subjects" in payload and isinstance(payload["subjects"], list):
         return BookExtraction(
@@ -93,7 +120,7 @@ def normalize_provider_payload(payload: Any) -> BookExtraction:
             subjects=[_normalize_subject(payload)],
         )
 
-    raise ValueError("OpenRouter returned neither a book extraction nor a subject object")
+    raise ValueError("NVIDIA returned neither a book extraction nor a subject object")
 
 
 def _looks_like_subject(payload: dict[str, Any]) -> bool:
@@ -104,7 +131,7 @@ def _looks_like_subject(payload: dict[str, Any]) -> bool:
 
 def _normalize_subject(payload: Any) -> SubjectExtraction:
     if not isinstance(payload, dict):
-        raise ValueError("OpenRouter returned a non-object subject")
+        raise ValueError("NVIDIA returned a non-object subject")
     raw_text = next(
         (
             payload.get(key)
@@ -172,19 +199,17 @@ def chunk_text(text: str, max_characters: int = 24000) -> list[str]:
 
 
 @dataclass(frozen=True)
-class OpenRouterExtractionProvider:
+class NVIDIAExtractionProvider:
     api_key: str
-    model: str = "minimax/minimax-m3:free"
-    base_url: str = "https://openrouter.ai/api/v1"
-    max_retries: int = 1
+    model: str = "nvidia/nemotron-3.5-lightning-30b-a3b"
+    base_url: str = "https://integrate.api.nvidia.com/v1"
+    timeout_seconds: float = 180
+    max_tokens: int = 8000
+    max_retries: int = 0
 
-    def _stream_completion(self, prompt: str) -> str:
-        response_text: list[str] = []
-        reasoning_text: list[str] = []
-        choice: dict[str, Any] = {}
-        terminal_trace("request", f"model={self.model} streaming=true")
-        with httpx.stream(
-            "POST",
+    def _completion(self, prompt: str) -> str:
+        terminal_trace("request", f"model={self.model} streaming=false")
+        response = httpx.post(
             f"{self.base_url}/chat/completions",
             headers={
                 "Authorization": f"Bearer {self.api_key}",
@@ -195,75 +220,41 @@ class OpenRouterExtractionProvider:
                 "messages": [
                     {
                         "role": "system",
-                        "content": (
-                            "Think privately, then return only the final valid JSON object. "
-                            "Never include your reasoning, analysis, markdown fences, or commentary."
-                        ),
+                        "content": extraction_system_prompt(),
                     },
                     {"role": "user", "content": prompt},
                 ],
                 "temperature": 0,
-                "max_tokens": 8000,
+                "max_tokens": self.max_tokens,
                 "reasoning": {"enabled": False},
                 "response_format": {"type": "json_object"},
                 "stream": False,
             },
-            timeout=60,
-        ) as response:
-            response.raise_for_status()
-            for line in response.iter_lines():
-                if not line or not line.startswith("data:"):
-                    continue
-                data = line.removeprefix("data:").strip()
-                if data == "[DONE]":
-                    break
-                event = json.loads(data)
-                choice = event.get("choices", [{}])[0]
-                delta = choice.get("delta", {})
-                reasoning = delta.get("reasoning") or ""
-                reasoning_details = delta.get("reasoning_details") or []
-                content = delta.get("content") or ""
-                if reasoning:
-                    reasoning_text.append(reasoning)
-                    terminal_trace("reasoning", reasoning)
-                    logger.info("OpenRouter reasoning: %s", reasoning)
-                for detail in reasoning_details:
-                    detail_text = detail.get("text") if isinstance(detail, dict) else None
-                    if detail_text:
-                        reasoning_text.append(detail_text)
-                        terminal_trace("reasoning_details", detail_text)
-                        logger.info("OpenRouter reasoning: %s", detail_text)
-                if content:
-                    response_text.append(content)
-                    terminal_trace("content_chunk", content)
-                    logger.info("OpenRouter final response: %s", content)
-
-        terminal_trace(
-            "stream_complete",
-            f"reasoning_chars={len(''.join(reasoning_text))} content_chars={len(''.join(response_text))} "
-            f"finish_reason={choice.get('finish_reason', 'unknown')}",
+            timeout=self.timeout_seconds,
         )
-        if not response_text:
-            finish_reason = choice.get("finish_reason", "unknown")
-            if reasoning_text:
-                logger.warning(
-                    "OpenRouter completed reasoning but returned no final content "
-                    "(finish_reason=%s)",
-                    finish_reason,
-                )
-            raise ValueError(
-                f"OpenRouter returned no final content (finish_reason={finish_reason})"
+        response.raise_for_status()
+        payload = response.json()
+        choice = payload.get("choices", [{}])[0]
+        message = choice.get("message", {})
+        content = message.get("content")
+        if isinstance(content, list):
+            content = "".join(
+                item.get("text", "") if isinstance(item, dict) else str(item)
+                for item in content
             )
-        final_response = "".join(response_text)
-        terminal_trace("raw_response", final_response)
-        return final_response
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError(
+                f"NVIDIA returned no final content (finish_reason={choice.get('finish_reason', 'unknown')})"
+            )
+        terminal_trace("raw_response", content)
+        return content
 
     def extract(self, text: str, page_count: int) -> BookExtraction:
         prompt = self._prompt(text, page_count)
         last_error: Exception | None = None
         for _ in range(self.max_retries + 1):
             try:
-                extraction = parse_provider_response(self._stream_completion(prompt))
+                extraction = parse_provider_response(self._completion(prompt))
                 terminal_trace(
                     "normalized",
                     f"subjects={len(extraction.subjects)} company={extraction.company.name or 'unknown'}",
@@ -274,12 +265,16 @@ class OpenRouterExtractionProvider:
                 last_error = error
                 terminal_trace("parse_error", str(error))
                 prompt += "\nReturn only the final JSON object. Do not include reasoning or markdown."
-        raise ValueError(f"OpenRouter returned invalid structured extraction: {last_error}") from last_error
+        raise ValueError(f"NVIDIA returned invalid structured extraction: {last_error}") from last_error
 
     @staticmethod
     def _prompt(text: str, page_count: int) -> str:
         instructions = [
             "Extract a PFE catalog into the requested JSON schema.",
+            "Return exactly one JSON object with keys company and subjects.",
+            "company must contain name, intro, mission, vision, and values.",
+            "Each subjects item must contain title, rawText, pageStart, and pageEnd.",
+            "The title must be the internship subject title, not a generic label or subject number.",
             "Do not invent information. Use empty strings or empty arrays when absent.",
             "Return company context and each internship subject as a complete raw text block.",
             "Use [PAGE N] markers for 1-based page ranges; use null when unavailable.",
@@ -289,3 +284,76 @@ class OpenRouterExtractionProvider:
             text,
         ]
         return "\n".join(instructions)
+
+
+@dataclass(frozen=True)
+class G4FExtractionProvider:
+    model: str = "default"
+    provider: str = "LLM7"
+    max_tokens: int = 8000
+    chunk_characters: int = 8000
+
+    def _completion(self, prompt: str) -> str:
+        from g4f.client import Client
+        from g4f import Provider
+
+        selected_provider = getattr(Provider, self.provider)
+        terminal_trace(
+            "request",
+            f"provider=g4f backend={self.provider} model={self.model}",
+        )
+        response = Client().chat.completions.create(
+            model=self.model,
+            provider=selected_provider,
+            messages=[
+                {"role": "system", "content": extraction_system_prompt()},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0,
+            max_tokens=self.max_tokens,
+        )
+        content = response.choices[0].message.content
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError("g4f returned no final content")
+        terminal_trace("raw_response", content)
+        return content
+
+    def extract(self, text: str, page_count: int) -> BookExtraction:
+        chunks = chunk_text(text, max_characters=self.chunk_characters)
+        extractions = [
+            _extract_with_provider(self._completion, chunk, page_count, "g4f")
+            for chunk in chunks
+        ]
+        company = next(
+            (
+                extraction.company
+                for extraction in extractions
+                if extraction.company.name
+                or extraction.company.intro
+                or extraction.company.mission
+                or extraction.company.vision
+                or extraction.company.values
+            ),
+            CompanyExtraction(),
+        )
+        subjects = [
+            subject
+            for extraction in extractions
+            for subject in extraction.subjects
+        ]
+        return BookExtraction(company=company, subjects=subjects)
+
+
+def _extract_with_provider(
+    completion: Any,
+    text: str,
+    page_count: int,
+    provider_name: str,
+) -> BookExtraction:
+    prompt = NVIDIAExtractionProvider._prompt(text, page_count)
+    extraction = parse_provider_response(completion(prompt))
+    terminal_trace(
+        "normalized",
+        f"provider={provider_name} subjects={len(extraction.subjects)}",
+    )
+    return extraction

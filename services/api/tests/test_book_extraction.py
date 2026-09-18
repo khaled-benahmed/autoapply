@@ -3,7 +3,7 @@ from unittest.mock import patch
 
 from app.book_extraction import (
     BookExtraction,
-    OpenRouterExtractionProvider,
+    NVIDIAExtractionProvider,
     chunk_text,
     parse_provider_response,
     provider_response_schema,
@@ -73,37 +73,44 @@ class BookExtractionTests(unittest.TestCase):
 
         self.assertEqual(extraction.subjects[0].title, "Data platform")
 
-    @patch("app.book_extraction.httpx.stream")
-    def test_streaming_provider_collects_reasoning_and_content(self, stream) -> None:
+    def test_parser_accepts_nvidia_internship_shape(self) -> None:
+        extraction = parse_provider_response(
+            '{"companyContext":"A Tunisian bank",'
+            '"internships":[{"rawText":"Build a dashboard",'
+            '"skills":["Power BI"],"location":"Tunis",'
+            '"contactDetails":"team@example.com"}]}'
+        )
+
+        self.assertEqual(extraction.company.intro, "A Tunisian bank")
+        self.assertEqual(extraction.subjects[0].rawText, "Build a dashboard")
+
+    @patch("app.book_extraction.httpx.post")
+    def test_nvidia_provider_collects_json_content(self, post) -> None:
         class FakeResponse:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *args):
-                return False
-
             def raise_for_status(self):
                 return None
 
-            def iter_lines(self):
-                return [
-                    'data: {"choices":[{"delta":{"reasoning":"thinking "}}]}',
-                    'data: {"choices":[{"delta":{"content":"{\\"company\\":{"}}]}',
-                    'data: [DONE]',
-                ]
+            def json(self):
+                return {"choices": [{"message": {"content": '{"company":{'} }]}
 
-        stream.return_value = FakeResponse()
-        provider = OpenRouterExtractionProvider("test-key")
+        post.return_value = FakeResponse()
+        provider = NVIDIAExtractionProvider("test-key")
 
-        result = provider._stream_completion("prompt")
+        result = provider._completion("prompt")
 
         self.assertEqual(result, '{"company":{')
+        self.assertEqual(post.call_args.kwargs["json"]["stream"], False)
+        self.assertEqual(post.call_args.kwargs["json"]["max_tokens"], 8000)
+        system_prompt = post.call_args.kwargs["json"]["messages"][0]["content"]
+        self.assertIn("ROLE: You are a document extraction service", system_prompt)
+        self.assertIn("Use exactly these top-level keys: company and subjects", system_prompt)
+        self.assertIn('"pageStart":null,"pageEnd":null', system_prompt)
 
     def test_terminal_trace_prints_and_flushes(self) -> None:
         with patch("builtins.print") as print_mock:
             terminal_trace("test", "value")
 
-        print_mock.assert_called_once_with("[OpenRouter:test] value", flush=True)
+        print_mock.assert_called_once_with("[NVIDIA:test] value", flush=True)
 
     def test_chunk_text_keeps_all_content(self) -> None:
         text = "page one\n\npage two\n\npage three"
