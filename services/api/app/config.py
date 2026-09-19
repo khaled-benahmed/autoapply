@@ -32,6 +32,9 @@ class Settings:
     )
     g4f_max_tokens: int = int(os.getenv("G4F_MAX_TOKENS", "8000"))
     g4f_chunk_characters: int = int(os.getenv("G4F_CHUNK_CHARACTERS", "8000"))
+    max_upload_bytes: int = int(
+        os.getenv("MAX_UPLOAD_BYTES", str(100 * 1024 * 1024))
+    )
 
 
 settings = Settings()

@@ -4,12 +4,10 @@ import { useEffect, useRef, useState } from "react";
 import {
   api,
   type CvProfile,
-  type CvResponse,
   emptyProfileText,
   profileFromLines,
 } from "../lib/api";
-
-const STORAGE_KEY = "autoapply_cv_last_hash";
+import { useCv } from "../lib/cv-context";
 
 const FIELDS: Array<{ key: keyof CvProfile; label: string; placeholder: string }> = [
   { key: "skills", label: "Skills (one per line)", placeholder: "- Python\n- SQL" },
@@ -19,12 +17,8 @@ const FIELDS: Array<{ key: keyof CvProfile; label: string; placeholder: string }
   { key: "certifications", label: "Certifications", placeholder: "- Deep Learning Specialization" },
 ];
 
-type Props = {
-  onCvReady: (cv: CvResponse | null) => void;
-};
-
-export default function CvPanel({ onCvReady }: Props) {
-  const [cv, setCv] = useState<CvResponse | null>(null);
+export default function CvPanel() {
+  const { cv, setCv, loading } = useCv();
   const [lines, setLines] = useState<Record<keyof CvProfile, string>>({
     skills: "",
     education: "",
@@ -37,23 +31,11 @@ export default function CvPanel({ onCvReady }: Props) {
   const fileRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    const last = window.localStorage.getItem(STORAGE_KEY);
-    if (last) {
-      api<CvResponse>("GET", `/cv/${last}`)
-        .then((saved) => {
-          setCv(saved);
-          setLines(emptyProfileText(saved.profile));
-          onCvReady(saved);
-        })
-        .catch(() => window.localStorage.removeItem(STORAGE_KEY));
-    }
-  }, [onCvReady]);
+    if (cv) setLines(emptyProfileText(cv.profile));
+  }, [cv]);
 
-  function applyCv(next: CvResponse) {
+  function applyCv(next: typeof cv) {
     setCv(next);
-    setLines(emptyProfileText(next.profile));
-    window.localStorage.setItem(STORAGE_KEY, next.cv_hash);
-    onCvReady(next);
   }
 
   async function upload(file: File) {
@@ -62,7 +44,7 @@ export default function CvPanel({ onCvReady }: Props) {
     const form = new FormData();
     form.append("file", file);
     try {
-      const up = await api<CvResponse>("POST", "/cv", { form });
+      const up = await api<NonNullable<typeof cv>>("POST", "/cv", { form });
       applyCv(up);
       setMessage("Parsed — review and correct the profile below.");
     } catch (error) {
@@ -77,7 +59,7 @@ export default function CvPanel({ onCvReady }: Props) {
     setBusy(true);
     setMessage("");
     try {
-      const updated = await api<CvResponse>("POST", `/cv/${cv.cv_hash}/profile`, {
+      const updated = await api<NonNullable<typeof cv>>("POST", `/cv/${cv.cv_hash}/profile`, {
         json: profileFromLines(lines),
       });
       applyCv(updated);
@@ -90,7 +72,7 @@ export default function CvPanel({ onCvReady }: Props) {
   }
 
   return (
-    <section className="content" id="cv">
+    <section className="content">
       <header className="topbar">
         <span>My CV</span>
         <span className="status-dot">Local setup</span>
@@ -135,6 +117,12 @@ export default function CvPanel({ onCvReady }: Props) {
           <button type="button" onClick={() => void save()} disabled={busy || !cv}>
             {busy ? "Saving…" : "Save profile"}
           </button>
+        </div>
+      )}
+
+      {!cv && !loading && (
+        <div className="panel">
+          <p className="hint">No CV yet — upload one above to unlock matching.</p>
         </div>
       )}
     </section>

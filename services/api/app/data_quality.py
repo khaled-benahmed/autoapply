@@ -371,5 +371,4 @@ def quality_report(extraction: Any) -> dict[str, Any]:
         "no_page": no_page,
         "mojibake": mojibake,
         "floor_trips": floor_trips,
-        "mojibake": mojibake,
     }

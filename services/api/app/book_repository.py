@@ -58,11 +58,6 @@ class BookRepository:
         with self._lock:
             self._records[record.file_hash] = record
 
-    def clear(self) -> None:
-        with self._lock:
-            self._records.clear()
-            self._index.clear()
-
     def save_extraction(self, file_hash: str, extraction_json: str) -> None:
         with self._lock:
             record = self._records[file_hash]
@@ -109,7 +104,7 @@ class BookRepository:
             if unicodedata.category(char) != "Mn"
         )
 
-    def _keyword_rows(self, query: str) -> list[dict]:
+    def _keyword_rows(self, query: str, book_hash: str | None = None) -> list[dict]:
         terms = [
             term
             for term in re.split(r"\s+", re.sub(r"[^\w\s'-]", " ", self._fold(query)).strip())
@@ -120,8 +115,10 @@ class BookRepository:
         compact_query = re.sub(r"\s+", "", self._fold(query))
         results: list[dict] = []
         with self._lock:
-            index = list(self._index.values())
-        for rows in index:
+            index = list(self._index.items())
+        for scoped_hash, rows in index:
+            if book_hash is not None and scoped_hash != book_hash:
+                continue
             for row in rows:
                 text = self._fold(row["text"])
                 title = self._fold(row["title"])
@@ -138,19 +135,26 @@ class BookRepository:
         results.sort(key=lambda result: -result["score"])
         return results
 
-    def search_keywords(self, query: str, limit: int = 20) -> list[dict]:
-        results = self._keyword_rows(query)[:limit]
+    def search_keywords(self, query: str, limit: int = 20, book_hash: str | None = None) -> list[dict]:
+        results = self._keyword_rows(query, book_hash=book_hash)[:limit]
         for row in results:
             row["source"] = "keyword"
         return results
 
-    def search_dense(self, query_embedding: list[float], limit: int = 20) -> list[dict]:
+    def search_dense(
+        self,
+        query_embedding: list[float],
+        limit: int = 20,
+        book_hash: str | None = None,
+    ) -> list[dict]:
         if not query_embedding:
             return []
         results: list[dict] = []
         with self._lock:
-            index = list(self._index.values())
-        for rows in index:
+            index = list(self._index.items())
+        for scoped_hash, rows in index:
+            if book_hash is not None and scoped_hash != book_hash:
+                continue
             for row in rows:
                 if not row.get("embedding"):
                     continue
@@ -169,11 +173,14 @@ class BookRepository:
         limit: int = 20,
         query_embedding: list[float] | None = None,
         k: int = 60,
+        book_hash: str | None = None,
     ) -> list[dict]:
-        keyword_rows = self._keyword_rows(query)[
+        keyword_rows = self._keyword_rows(query, book_hash=book_hash)[
             : max(limit * 4, _CANDIDATE_POOL)
         ]
-        dense_rows = self.search_dense(query_embedding, max(limit * 4, _CANDIDATE_POOL))
+        dense_rows = self.search_dense(
+            query_embedding, max(limit * 4, _CANDIDATE_POOL), book_hash=book_hash
+        )
         if not query_embedding:
             return keyword_rows[:limit]
         return _rff_merge(keyword_rows, dense_rows, limit=limit, k=k)
@@ -252,9 +259,11 @@ _KEYWORD_SELECT = """
            + COALESCE(similarity(text, %s), 0)
            + CASE WHEN REPLACE(COALESCE(reference, ''), ' ', '') ILIKE '%%' || %s || '%%' THEN 0.5 ELSE 0 END AS score
     FROM book_subjects
-    WHERE plainto_tsquery('app_search', %s) @@ tokens
+    WHERE (
+       plainto_tsquery('app_search', %s) @@ tokens
        OR COALESCE(similarity(text, %s), 0) > 0.1
        OR REPLACE(COALESCE(reference, ''), ' ', '') ILIKE '%%' || %s || '%%'
+    )
 """
 
 
@@ -542,31 +551,46 @@ class PostgresBookRepository:
             ).fetchall()
         return rows
 
-    def search_keywords(self, query: str, limit: int = 20) -> list[dict]:
+    def search_keywords(
+        self, query: str, limit: int = 20, book_hash: str | None = None
+    ) -> list[dict]:
         self._ensure_schema()
+        where = " AND book_hash = %s" if book_hash else ""
+        params = [query] * 7
+        if book_hash:
+            params.append(book_hash)
         with self._pool.connection(timeout=10) as connection:
             rows = connection.execute(
-                _KEYWORD_SELECT + "ORDER BY score DESC, id LIMIT %s",
-                (query, query, query, query, query, query, query, limit),
+                _KEYWORD_SELECT + where + " ORDER BY score DESC, id LIMIT %s",
+                (*params, limit),
             ).fetchall()
         return _tag_source(rows, "keyword")
 
-    def search_dense(self, query_embedding: list[float], limit: int = 20) -> list[dict]:
+    def search_dense(
+        self,
+        query_embedding: list[float],
+        limit: int = 20,
+        book_hash: str | None = None,
+    ) -> list[dict]:
         self._ensure_schema()
         vector = _vector_literal(query_embedding)
+        where = " AND book_hash = %s" if book_hash else ""
+        params = [vector, vector]
+        if book_hash:
+            params.append(book_hash)
         with self._pool.connection(timeout=10) as connection:
             rows = connection.execute(
-                """
+                f"""
                 SELECT TRIM(book_hash) AS book_hash, reference, title, text, raw_text,
                        page_start, page_end,
                        (1 - (embedding <=> %s::vector)) AS score
                 FROM book_subjects
                 WHERE embedding IS NOT NULL
-                  AND (1 - (embedding <=> %s::vector)) > 0.2
+                  AND (1 - (embedding <=> %s::vector)) > 0.2{where}
                 ORDER BY score DESC, id
                 LIMIT %s
                 """,
-                (vector, vector, limit),
+                (*params, limit),
             ).fetchall()
         return _tag_source(rows, "dense")
 
@@ -576,11 +600,12 @@ class PostgresBookRepository:
         limit: int = 20,
         query_embedding: list[float] | None = None,
         k: int = 60,
+        book_hash: str | None = None,
     ) -> list[dict]:
         self._ensure_schema()
         pool = max(limit * 4, _CANDIDATE_POOL)
-        keyword_rows = self.search_keywords(query, pool)
+        keyword_rows = self.search_keywords(query, pool, book_hash=book_hash)
         if not query_embedding:
             return keyword_rows[:limit]
-        dense_rows = self.search_dense(query_embedding, pool)
+        dense_rows = self.search_dense(query_embedding, pool, book_hash=book_hash)
         return _rff_merge(keyword_rows, dense_rows, limit=limit, k=k)

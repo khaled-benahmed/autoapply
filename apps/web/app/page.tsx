@@ -1,12 +1,12 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
-import CvPanel from "../components/CvPanel";
-import Library from "../components/Library";
-import Matches from "../components/Matches";
-import { api, type BookInfoRow, type CvResponse } from "../lib/api";
+import Link from "next/link";
+import { useEffect, useState } from "react";
+import { api, type BookInfoRow } from "../lib/api";
+import { useCv } from "../lib/cv-context";
 
-function Overview({ cv }: { cv: CvResponse | null }) {
+export default function Home() {
+  const { cv } = useCv();
   const [books, setBooks] = useState<BookInfoRow[] | null>(null);
   const [totalSubjects, setTotalSubjects] = useState(0);
 
@@ -17,7 +17,7 @@ function Overview({ cv }: { cv: CvResponse | null }) {
         setTotalSubjects(rows.reduce((sum, row) => sum + row.subjects, 0));
       })
       .catch(() => {});
-  }, [cv]);
+  }, []);
 
   const signals = [
     {
@@ -38,7 +38,7 @@ function Overview({ cv }: { cv: CvResponse | null }) {
   ];
 
   return (
-    <section className="content" id="overview">
+    <section className="content">
       <header className="topbar">
         <span>Candidate workspace</span>
         <span className="status-dot">Indexed &amp; searchable</span>
@@ -69,7 +69,7 @@ function Overview({ cv }: { cv: CvResponse | null }) {
             <p className="eyebrow">Baseline</p>
             <h2>Books → index</h2>
             <p>Extract each PFE book (LLM), view its subjects, and keep the library indexed.</p>
-            <a className="nav-lookup" href="#books">Go to books <span aria-hidden="true">↗</span></a>
+            <Link className="nav-lookup" href="/books">Go to books <span aria-hidden="true">↗</span></Link>
           </div>
         </article>
         <article className="launch-card" id="cv-lookup">
@@ -78,7 +78,7 @@ function Overview({ cv }: { cv: CvResponse | null }) {
             <p className="eyebrow">Your context</p>
             <h2>CV → match</h2>
             <p>Upload your CV, correct what the parser misses, then review the ranked subjects.</p>
-            <a className="nav-lookup" href="#matches">Go to matches <span aria-hidden="true">↗</span></a>
+            <Link className="nav-lookup" href="/matches">Go to matches <span aria-hidden="true">↗</span></Link>
           </div>
         </article>
       </div>
@@ -95,35 +95,5 @@ function Overview({ cv }: { cv: CvResponse | null }) {
         </p>
       </section>
     </section>
-  );
-}
-
-export default function Home() {
-  const [cv, setCv] = useState<CvResponse | null>(null);
-  const handleCvReady = useCallback((next: CvResponse | null) => setCv(next), []);
-
-  return (
-    <main className="shell">
-      <aside className="sidebar">
-        <div className="brand"><span className="brand-mark">A</span><span>AutoApply</span></div>
-        <nav className="nav" aria-label="Primary navigation">
-          <a className="nav-link" href="#overview"><span>01</span>Overview</a>
-          <a className="nav-link" href="#books"><span>02</span>PFE books</a>
-          <a className="nav-link" href="#cv"><span>03</span>My CV</a>
-          <a className="nav-link" href="#matches"><span>04</span>Matches</a>
-        </nav>
-        <div className="sidebar-note">
-          <span className="eyebrow">Private by default</span>
-          <p>Your documents and matches stay in your local workspace and Postgres.</p>
-        </div>
-      </aside>
-
-      <div className="pages">
-        <Overview cv={cv} />
-        <Library />
-        <CvPanel onCvReady={handleCvReady} />
-        <Matches cv={cv} />
-      </div>
-    </main>
   );
 }

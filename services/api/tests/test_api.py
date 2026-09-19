@@ -83,6 +83,36 @@ class UploadBookTests(unittest.TestCase):
         self.assertEqual(FakeStorage.uploads, 2)
 
 
+class UploadSizeLimitTests(unittest.TestCase):
+    def setUp(self) -> None:
+        main.book_repository = BookRepository()
+        FakeStorage.uploads = 0
+        self.client = TestClient(app)
+
+    @patch("app.main.ObjectStorage", FakeStorage)
+    @patch("app.main.extract_pdf")
+    def test_book_upload_rejects_oversized_content_length(self, extract_pdf) -> None:
+        extract_pdf.return_value = ExtractionResult("catalog", 1, False)
+
+        response = self.client.post(
+            "/books",
+            files={"file": ("book.pdf", b"pdf-content", "application/pdf")},
+            headers={"Content-Length": str(main.settings.max_upload_bytes + 1)},
+        )
+
+        self.assertEqual(response.status_code, 413)
+        self.assertNotIn(b"pdf-content", extract_pdf.call_args_list)
+
+    def test_cv_upload_rejects_oversized_content_length(self) -> None:
+        response = self.client.post(
+            "/cv",
+            files={"file": ("cv.txt", b"x" * 10, "text/plain")},
+            headers={"Content-Length": str(main.settings.max_upload_bytes + 1)},
+        )
+
+        self.assertEqual(response.status_code, 413)
+
+
 _EXTRACTION_PAYLOAD = {
     "company": {"name": "Numeryx", "mission": None, "vision": None, "values": [], "intro": None},
     "subjects": [
@@ -466,3 +496,84 @@ class CvRouteTests(unittest.TestCase):
         books = self.client.get("/books").json()
         self.assertEqual(books[0]["subjects"], 2)
         self.assertTrue(books[0]["has_extraction"])
+
+
+class MatchBookScopingTests(unittest.TestCase):
+    BOOK_A = "f" * 64
+    BOOK_B = "h" * 64
+
+    def setUp(self) -> None:
+        main.book_repository = BookRepository()
+        main.embedder = NullEmbedder()
+        self.client = TestClient(app)
+        for file_hash, filename in ((self.BOOK_A, "book-a.pdf"), (self.BOOK_B, "book-b.pdf")):
+            main.book_repository.save(
+                BookRecord(
+                    file_hash=file_hash,
+                    object_ref=f"s3://test/{filename}",
+                    filename=filename,
+                    page_count=10,
+                    extracted_text="text",
+                    used_ocr=False,
+                )
+            )
+        main.book_repository.replace_index_subjects(
+            self.BOOK_A,
+            [
+                IndexSubject(reference="F1/26", title="Audit Fiscal", text="audit informatique analyse de données", raw_text="", page_start=1, page_end=1),
+                IndexSubject(reference="F2/26", title="Autre Sujet", text="tennis photographie", raw_text="", page_start=1, page_end=1),
+            ],
+        )
+        main.book_repository.replace_index_subjects(
+            self.BOOK_B,
+            [
+                IndexSubject(reference="H1/26", title="Data Platform", text="audit analyse de données Python", raw_text="", page_start=1, page_end=1),
+                IndexSubject(reference="H2/26", title="Réseaux Sociaux", text="communication marketing", raw_text="", page_start=1, page_end=1),
+            ],
+        )
+        upload = self.client.post(
+            "/cv",
+            files={
+                "file": (
+                    "cv.txt",
+                    "COMPÉTENCES\n- audit informatique\n- analyse de données\n".encode("utf-8"),
+                    "text/plain",
+                )
+            },
+        )
+        self.assertEqual(upload.status_code, 201)
+        self.cv_hash = upload.json()["cv_hash"]
+
+    def _match(self, book_hash: str | None):
+        params: dict[str, str] = {}
+        if book_hash:
+            params["book_hash"] = book_hash
+        return self.client.post(f"/cv/{self.cv_hash}/match", params=params)
+
+    def test_unscoped_match_covers_all_books(self) -> None:
+        match = self._match(None).json()
+
+        hashes = {row["book_hash"] for row in match["results"]}
+        self.assertIn(self.BOOK_A, hashes)
+        self.assertIn(self.BOOK_B, hashes)
+
+    def test_match_with_book_scopes_results_to_that_book(self) -> None:
+        match = self._match(self.BOOK_A).json()
+
+        hashes = {row["book_hash"] for row in match["results"]}
+        self.assertEqual(hashes, {self.BOOK_A})
+        self.assertEqual(match["results"][0]["title"], "Audit Fiscal")
+
+    def test_match_scopes_to_second_book(self) -> None:
+        match = self._match(self.BOOK_B).json()
+
+        hashes = {row["book_hash"] for row in match["results"]}
+        self.assertEqual(hashes, {self.BOOK_B})
+        self.assertEqual(match["results"][0]["title"], "Data Platform")
+
+    def test_match_unknown_book_is_404(self) -> None:
+        response = self.client.post(
+            f"/cv/{self.cv_hash}/match", params={"book_hash": "z" * 64}
+        )
+
+        self.assertEqual(response.status_code, 404)

@@ -64,12 +64,13 @@ button span { margin-left: 12px; }
 .grid-4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-bottom: 16px; }
 .field { display: flex; flex-direction: column; gap: 6px; }
 .field span { font-family: 'DM Mono', monospace; font-size: 11px; text-transform: uppercase; letter-spacing: .07em; color: var(--muted); }
-.field textarea, .field--inline input {
+.field textarea, .field--inline input, .field--inline select {
   width: 100%; background: var(--paper); border: 1px solid var(--line); color: var(--ink);
   border-radius: 4px; padding: 10px; font: 12px/1.5 'DM Mono', monospace; resize: vertical; min-height: 120px;
 }
 .field--inline { display: flex; flex-direction: row; align-items: center; gap: 8px; }
-.field--inline input { min-height: 0; width: 74px; padding: 9px 10px; }
+.field--inline input, .field--inline select { min-height: 0; width: 74px; padding: 9px 10px; }
+.field--inline select { width: min(280px, 100%); }
 .match-controls { display: flex; align-items: flex-end; gap: 22px; flex-wrap: wrap; }
 .check { display: flex; align-items: center; gap: 8px; font-size: 14px; cursor: pointer; }
 .check input { accent-color: var(--ink); }

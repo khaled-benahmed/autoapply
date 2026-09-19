@@ -6,7 +6,7 @@ from hashlib import sha256
 from io import BytesIO
 from uuid import uuid4
 
-from fastapi import FastAPI, File, HTTPException, Query, Response, UploadFile, status
+from fastapi import FastAPI, File, HTTPException, Query, Request, Response, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -94,14 +94,37 @@ def list_books() -> list[BookInfoRow]:
     return [BookInfoRow(**row) for row in book_repository.list_books()]
 
 
+def _reject_oversized(request: Request) -> None:
+    content_length = request.headers.get("content-length")
+    if not content_length:
+        return
+    try:
+        size = int(content_length)
+    except ValueError:
+        return
+    if size > settings.max_upload_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"Upload exceeds the {settings.max_upload_bytes}-byte limit",
+        )
+
+
 @app.post("/books", response_model=UploadResponse, status_code=status.HTTP_201_CREATED)
-async def upload_book(response: Response, file: UploadFile = File(...)) -> UploadResponse:
+async def upload_book(
+    request: Request, response: Response, file: UploadFile = File(...)
+) -> UploadResponse:
     if file.content_type != "application/pdf":
         raise HTTPException(status_code=415, detail="Only PDF files are supported")
 
+    _reject_oversized(request)
     content = await file.read()
     if not content:
         raise HTTPException(status_code=400, detail="The uploaded PDF is empty")
+    if len(content) > settings.max_upload_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"Upload exceeds the {settings.max_upload_bytes}-byte limit",
+        )
 
     file_hash = sha256(content).hexdigest()
     existing_book = book_repository.get_by_hash(file_hash)
@@ -295,8 +318,14 @@ def _read_upload_text(filename: str, content: bytes) -> str:
 
 
 @app.post("/cv", response_model=CvResponse, status_code=status.HTTP_201_CREATED)
-def upload_cv(file: UploadFile = File(...)) -> CvResponse:
+def upload_cv(request: Request, file: UploadFile = File(...)) -> CvResponse:
+    _reject_oversized(request)
     content = file.file.read()
+    if len(content) > settings.max_upload_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"Upload exceeds the {settings.max_upload_bytes}-byte limit",
+        )
     cv_hash = sha256(content).hexdigest()
     raw_text = _read_upload_text(file.filename or "cv.txt", content)
     profile = parse_cv(raw_text)
@@ -333,12 +362,20 @@ def get_cv(cv_hash: str) -> CvResponse:
 @app.post("/cv/{cv_hash}/match", response_model=CvMatchResponse)
 def match_cv(
     cv_hash: str,
+    book_hash: str | None = Query(
+        None,
+        description="Restrict matching to subjects of a single book (recommended).",
+    ),
     limit: int = Query(10, ge=1, le=100),
     dense: bool = Query(True, description="Use hybrid (keyword + dense RRF) matching"),
 ) -> CvMatchResponse:
     record = book_repository.get_cv(cv_hash)
     if not record:
         raise HTTPException(status_code=404, detail="CV not found")
+    if book_hash:
+        book = book_repository.get_by_hash(book_hash)
+        if not book:
+            raise HTTPException(status_code=404, detail="Book not found")
     profile = CvProfile(**json.loads(record.profile_json))
     query = profile.query
     query_embedding: list[float] | None = None
@@ -350,9 +387,11 @@ def match_cv(
             logger.exception("CV query embedding failed; falling back to keyword matching")
             query_embedding = None
     results = (
-        book_repository.search_hybrid(query, limit, query_embedding=query_embedding)
+        book_repository.search_hybrid(
+            query, limit, query_embedding=query_embedding, book_hash=book_hash
+        )
         if dense
-        else book_repository.search_keywords(query, limit)
+        else book_repository.search_keywords(query, limit, book_hash=book_hash)
     )
     return CvMatchResponse(
         cv_hash=cv_hash,
