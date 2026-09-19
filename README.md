@@ -1,283 +1,160 @@
 # AutoApply
 
+PFE-book → CV matching: AutoApply parses PFE books (end-of-studies internship catalogs) and candidate CVs, then uses hybrid search to rank the most relevant subject and drafts a tailored application.
+
 ## Current status
 
-The initial Phase 0 foundation is in place:
+Working, live baseline (single-user, local-first):
 
-- `apps/web`: Next.js candidate workspace shell
-- `services/api`: FastAPI service with `/health`, PDF extraction, and SHA-256 book deduplication
-- `services/worker`: extraction worker boundary
-- `packages/shared`: structured extraction schema
-- `docker-compose.yml`: Postgres with pgvector and Redis
+- **`apps/web`** — Next.js 14 candidate workspace, split into `/` (overview), `/books` (PFE book upload + indexing), `/cv` (CV upload/edit), `/matches` (book-scoped CV→subject matching). Shared `AppShell` sidebar, CV state shared across pages.
+- **`services/api`** — FastAPI service: PDF upload/extraction, LLM structured extraction, data-quality layer, subject indexing, hybrid search, CV parsing + matching.
+- **`services/worker`** — reserved boundary for future async PDF/LLM jobs.
+- **`packages/shared`** — shared structured-extraction schema.
+- **`docker-compose.yml`** — Postgres 16 + pgvector, Redis, MinIO, and the API (live reload).
+- **QA console** — a single-page UI (`app/static/index.html`, no build step) served at `GET /` for CV upload → edit profile → match, plus Search and Library & Index tabs.
+- **Tests** — 103 passing (unit + integration; Postgres integration runs when `TEST_DATABASE_URL` is set).
+
+## Features (implemented)
+
+- **PDF ingestion** — `POST /books` uploads PFE PDFs to MinIO (SHA-256 dedup, page count, OCR-flagging), extracts text with PyMuPDF, Tesseract OCR fallback for scans.
+- **LLM structured extraction** — `POST /books/{hash}/extract` runs a configurable `g4f` provider cascade (keyless) with retries + timeouts; output validated against a Pydantic schema; chunked for oversized texts.
+- **Data-quality layer** — applied at index time (raw text untouched): mojibake repair, known-junk strip, per-book boilerplate detection (block edges only), subject dedup/title recovery, `quality_report` with an over-strip tripwire.
+- **Subject indexing** — `POST /books/{hash}/index` (and `/books/index-all`): stores subjects with French accent-insensitive `tsvector`, `pg_trgm` GIN, and a 384-d `embedding` vector + HNSW cosine index. Embeddings come from a **local** `fastembed` ONNX model (no API key); if unavailable, search falls back to keyword-only.
+- **Hybrid search** — `GET /search?q=...&dense=true` returns keyword-channel + dense-channel rankings merged by **Reciprocal Rank Fusion** (`k=60`); every row carries a `source` badge (`keyword` / `dense` / `both`).
+- **CV integration** — `POST /cv` parses FR/EN CVs (skills, education, experience, projects, certifications), `POST /cv/{hash}/profile` allows manual correction, and `POST /cv/{hash}/match?dense=true&book_hash=...` ranks subjects for a CV.
+- **Per-book scoping** — matching can be restricted to a single book via `book_hash` (validated 404); scoping is applied in both channels (keyword + dense).
+- **Upload limits** — `MAX_UPLOAD_BYTES` (default 100 MB) caps book/CV uploads with HTTP 413.
 
 ## Run locally
 
-```bash
-npm install
-npm run dev:web
-```
-
-The web app runs at `http://localhost:3000`.
-
-To start infrastructure and the API:
+Prerequisites: Docker Desktop, Node.js 18+, Python 3.11+.
 
 ```bash
+# 1. Configure environment
+cp .env.example .env        # adapt passwords / provider pool
+
+# 2. Infrastructure + API (postgres, redis, minio, api on :8000)
 docker compose up --build
+
+# 3. Frontend
+npm install
+npm run dev:web             # http://localhost:3000
 ```
 
-The API health check is available at `http://localhost:8000/health`.
+- API health check: `http://localhost:8000/health`
+- QA console + original single-page UI: `http://localhost:8000/`
+- API docs (OpenAPI): `http://localhost:8000/docs`
 
-AutoApply is a free / open-source tool that parses PFE books (end-of-studies internship catalogs) and candidate CVs, then uses hybrid search to rank the most relevant subject and draft a tailored application.
+### Tests
 
-## Problem
+```bash
+cd services/api
+python -m pytest tests -q                    # unit suite (skips Postgres integration)
+# with a live Postgres reachable on localhost, point TEST_DATABASE_URL at it
+# (e.g. postgresql://autoapply:password@localhost:5432/autoapply — host swapped
+#  to localhost because the container hostname "postgres" only resolves in Docker):
+$env:TEST_DATABASE_URL = "postgresql://autoapply:password@localhost:5432/autoapply"
+python -m pytest tests -q                    # 103 passed incl. Postgres integration
+```
 
-A PFE book is usually a PDF containing:
+### Key environment variables
 
-- company intro / mission / vision pages
-- many subjects with inconsistent layouts
-- title, description, required skills, location, and sometimes a contact person
+Set in `.env` (see `.env.example`):
 
-Candidates typically skim the full PDF manually to find a subject that both fits their skillset and is worth targeting in a motivation email. AutoApply removes that time sink.
+| Variable | Purpose |
+|---|---|
+| `DATABASE_URL` | Postgres DSN for the API container |
+| `POSTGRES_PASSWORD`, `MINIO_ROOT_USER`, `MINIO_ROOT_PASSWORD` | Infra secrets |
+| `G4F_PROVIDER_POOL` | Ordered `Provider:Model` cascade for extraction |
+| `G4F_MAX_TOKENS`, `G4F_CHUNK_CHARACTERS` | LLM extraction limits |
+| `MAX_UPLOAD_BYTES` | Upload cap, default 104857600 (100 MB) |
+
+## API surface
+
+| Method & path | Purpose |
+|---|---|
+| `GET /health` | Liveness + DB/embedder status |
+| `GET /books` | List uploaded books (filename, hash, subject count) |
+| `POST /books` | Upload PFE PDF (multipart `file`) |
+| `POST /books/{hash}/extract` | Run LLM structured extraction |
+| `POST /books/{hash}/index` | Build searchable subject index |
+| `POST /books/index-all` | Index all extracted books |
+| `GET /books/{hash}/index` | List indexed subjects |
+| `GET /search?q=...&dense=true` | Hybrid search over all books |
+| `POST /cv` | Upload + parse CV (txt/md/pdf) |
+| `GET /cv/{hash}` | Get parsed profile |
+| `POST /cv/{hash}/profile` | Overwrite parsed sections |
+| `POST /cv/{hash}/match?dense=true&book_hash=...` | Rank subjects for a CV (optionally scoped to one book) |
 
 ## Core workflow
 
-1. Upload PFE book
-2. Upload CV
-3. Parse both documents into structured data
-4. Rank subjects with hybrid search
-5. Generate a tailored email or LinkedIn message for the best match
-6. Optionally send from the candidate’s own connected mailbox
-7. Optionally suggest CV improvements from a personal project bank
-
-## Hard problems to solve first
-
-### 1. Book segmentation
-
-PFE books vary heavily by company, so layout-specific regexes are not enough. The MVP should use LLM-based structured extraction for the whole book, with OCR fallback for scanned PDFs.
-
-
-### 2. Trust on send
-
-Auto-sending mail can become spammy quickly. The default should be review-and-approve, and any send action should use the candidate’s own OAuth-connected mailbox.
+1. Upload a PFE book (`POST /books`).
+2. Extract structured subjects (`POST /books/{hash}/extract` — LLM).
+3. Index subjects (`POST /books/{hash}/index` — keyword + embedding).
+4. Upload a CV (`POST /cv`), correct the parsed profile if needed.
+5. Match the CV against one book or all (`POST /cv/{hash}/match`) — hybrid RRF ranking.
+6. Generate a tailored email for the best match — *planned (E4), not built*.
 
 ## Architecture
 
 ```mermaid
 flowchart TB
     subgraph Client
-        FE[Web App - Next.js]
+        FE["Web App - Next.js<br/>/, /books, /cv, /matches"]
+        QA["QA Console - static single page"]
     end
 
     subgraph API
-        GW[Backend API - FastAPI]
-    end
-
-    subgraph Workers[Async Workers]
-        Q[(Job Queue - Redis)]
-        PDFP[PDF/OCR Extractor]
-        BOOKX[Book Segmentation\nLLM structured extraction]
-        CVX[CV Parser\nLLM structured extraction]
+        GW[FastAPI]
     end
 
     subgraph Data
-        PG[(Postgres\nusers, subjects, cvs, matches)]
-        VEC[(pgvector index\nhybrid: embeddings + tsvector/BM25)]
-        OBJ[(Object storage - PDFs)]
-    end
-
-    subgraph AISvc[AI Services]
-        MATCH[Matching & Ranking\nhybrid search + LLM rerank]
-        GEN[Email / LinkedIn Message Generator]
-        TAILOR[CV Tailoring Recommender]
-    end
-
-    subgraph SendPath[Optional Send]
-        OAUTH[Candidate's own Gmail/Outlook via OAuth]
+        PG["Postgres + pgvector<br/>books, book_subjects, cv_profiles"]
+        OBJ["MinIO object storage - PDFs"]
     end
 
     FE --> GW
+    QA --> GW
     GW --> OBJ
-    GW --> Q
-    Q --> PDFP --> BOOKX
-    Q --> CVX
-    BOOKX --> PG
-    BOOKX --> VEC
-    CVX --> PG
-    CVX --> VEC
-    GW --> MATCH --> VEC
-    MATCH --> PG
-    GW --> GEN --> PG
-    GW --> TAILOR --> PG
-    GEN --> OAUTH
-```
+    GW -->|"index: build tsvector + pgvector rows"| PG
+    GW -->|"hybrid search: keyword + dense, RRF"| PG
+    ```
 
-## Component choices
-
-- Backend API: Python + FastAPI
-- Frontend: Next.js + Tailwind
-- Database: Postgres
-- Hybrid search: pgvector + tsvector/BM25 with Reciprocal Rank Fusion
-- Queue: Redis + RQ or Celery
-- PDF/OCR: PyMuPDF or pdfplumber, with Tesseract fallback
-- Object storage: S3-compatible, with MinIO for self-hosting
-- Deployment: Docker Compose for self-host, GitHub Actions for CI
+Future (not yet built): async workers (Redis queue), LLM rerank, email generator, OAuth send, multi-user auth.
 
 ## AI strategy
 
-The system should support both self-hosted and free-tier cloud providers through a provider abstraction layer.
-
-### Default extraction mode
-
-- temperature 0
-- structured output / JSON schema validation
-- validation + retry on malformed output
-- separate prompts for segmentation and field extraction
-
-###  embedding model
-
-- gemini-embedding-2 (or current Gemini embedding model) via Google AI Studio
-- multilingual and lightweight enough for laptop use
-- can provide dense and sparse signals for hybrid search
-
-### g4f extraction
-
-The API uses the community-maintained `g4f` client through its provider abstraction. Extraction runs through an ordered provider cascade; each tier is tried in sequence until one returns valid extraction JSON:
-
-1. `Gemini` / `gemini-3.6-flash` (primary)
-2. `Cloudflare` / `glm-5.2`
-3. `Gemini` / `gemini-3.1-flash-lite`
-4. `LLM7` / `default` (final fallback)
-
-The cascade is configurable through the `G4F_PROVIDER_POOL` environment variable as a comma-separated `Provider:Model` list:
-
-```powershell
-$env:G4F_PROVIDER_POOL = "Gemini:gemini-3.6-flash,Cloudflare:glm-5.2,Gemini:gemini-3.1-flash-lite,LLM7:default"
-$env:G4F_MAX_TOKENS = "8000"
-$env:G4F_CHUNK_CHARACTERS = "8000"
-docker compose up --build
-```
-
-Then call `POST /books/{file_hash}/extract`. Each provider in the pool is retried twice; if the whole pool fails, the endpoint returns a 500 with the per-provider errors. The application validates the returned text against the Pydantic extraction schema before saving it.
-
+- **Extraction** — keyless `g4f` provider cascade (`Gemini` primary → `Cloudflare` → `Gemini-lite` → `LLM7`), each tier retried 2× with a 120 s timeout; configurable via `G4F_PROVIDER_POOL`. Malformed output falls through to the next provider; all-fail returns 500.
+- **Embeddings** — local `fastembed` (ONNX, CPU) with `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` (384-d, one-time ~0.22 GB Hugging Face download, no key). Replaced the planned Gemini embedding vendored approach to stay keyless and offline-capable.
+- **Ranking** — keyword channel (French `app_search` config: `unaccent` + `simple` on both index and query, `ts_rank_cd` ×3 + `pg_trgm` similarity + compact-reference bonus) and dense channel (cosine similarity, threshold > 0.2), merged with RRF `k=60`. `source` per row, `book_hash` scoping in both channels.
 
 ## Core data model
 
-- User: id, email, auth fields
-- PFEBook: id, file_hash, company_id, raw_pdf_ref, parsed_intro, status
-- Company: id, name, mission_vision_text, values_extracted
-- Subject: id, book_id, department, title, description, required_skills, location, contact
-- CV: id, user_id, raw_pdf_ref, parsed_profile_json
-- ProjectBankItem: id, user_id, title, description, skills, included_in_active_cv
-- Match: id, cv_id, subject_id, hybrid_score, llm_rationale
-- GeneratedMessage: id, match_id, type, draft_text, status
-- SendLog: id, message_id, sent_at, provider, status
+Live tables (created at API startup):
 
-## Roadmap
+- **books** — `file_hash`, `filename`, MinIO `object_ref`, page count, extracted text, OCR flag, `extraction_json` JSONB.
+- **book_subjects** — `book_hash`, `reference`, `title`, cleaned `text`, `raw_text`, page range, `tokens` (tsvector), `embedding` (vector(384), HNSW).
+- **cv_profiles** — `cv_hash`, `filename`, `raw_text`, `profile_json` (skills/education/experience/projects/certifications).
 
-### Phase 0: Foundations
+Planned/spec-only entities (multi-user product): User/auth, Company, ProjectBankItem, Match, GeneratedMessage, SendLog.
 
-- repo scaffolding
-- Docker Compose
-- CI pipeline
-- auth
-- provider abstraction for LLMs and embeddings
-- basic admin / cost dashboard stub
+## Roadmap status
 
-### Phase 1: MVP
-
-- PFE book upload and parsing
-- file-hash deduplication
-- company intro and subject extraction
-- CV upload and parsing
-- embeddings for subjects and CVs
-- keyword index and RRF ranking
-- ranked subject browser with filters
-- optional rerank with short rationale
-
-### Phase 2: Application assistance
-
-- motivation email generation
-- editable in-UI draft
-- attach CV to draft
-- LinkedIn message variant
-- project bank CRUD
-- CV tailoring recommendations
-
-### Phase 3: Automation and trust
-
-- Gmail / Outlook OAuth
-- review-and-approve before send
-- optional opt-in auto-send
-- send log and follow-up reminder
-- multiple books per account
-- application history
-
-### Phase 4: Open-source and scale readiness
-
-- usage caps for hosted deployments
-- self-host documentation
-- local-model setup guide
-- opt-in outcome tracking
-
-## Backlog
-
-### Phase 0
-
-- E0.1 Repository scaffolding, Docker Compose, CI pipeline
-- E0.2 Auth with email/password
-- E0.3 LLM and embedding provider abstraction
-- E0.4 Basic admin/cost dashboard stub
-
-### Phase 1
-
-- E1.1 Upload PDF, extract raw text, OCR fallback
-- E1.2 File-hash dedup for already parsed books
-- E1.3 LLM structured extraction for company intro / mission / values
-- E1.4 LLM structured extraction for subject list
-- E1.5 Human-in-the-loop review UI for extracted subjects
-- E2.1 Upload CV, extract structured profile
-- E2.2 Manual edit of parsed CV fields
-- E3.1 Generate embeddings for subjects and CVs
-- E3.2 Keyword/BM25 index over subjects
-- E3.3 Combine semantic and keyword scores with RRF
-- E3.4 LLM rerank top-K with rationale
-- E3.5 Ranked subject browser with filters
-
-### Phase 2
-
-- E4.1 Motivation email generator
-- E4.2 Editable draft in UI
-- E4.3 Attach CV to draft
-- E4.4 LinkedIn message variant
-- E5.1 Project bank CRUD
-- E5.2 Compare project bank and CV against required skills
-- E5.3 Non-destructive swap suggestions with rationale
-- E5.4 One-click apply suggestion to generate CV draft
-
-### Phase 3
-
-- E6.1 Gmail / Outlook OAuth
-- E6.2 Review-and-approve before send
-- E6.3 Optional automatic send toggle, opt-in, rate-limited
-- E6.4 Send log and follow-up reminder
-- E7.1 Save multiple books and companies per account
-- E7.2 Cross-book search
-- E7.3 Application history
-
-### Phase 4
-
-- E8 Per-user usage caps for hosted deployments
-- E9 Self-host documentation and local-model guide
-- E10 Opt-in outcome tracking to improve ranking over time
+- ✅ **Phase 0 — Foundations**: monorepo scaffold, Docker Compose, provider abstraction (g4f cascade, fastembed).
+- ✅ **Phase 1 — MVP (mostly)**: PDF upload + OCR fallback, dedup, LLM subject extraction, CV upload + parsing + manual edit, subject embeddings, keyword index + RRF, per-book scoping, QA console & web pages.
+- ⏳ **Phase 1 remaining**: ranked-subject browser with filters, LLM rerank with rationale, ground-truth CV fixture + precision@k validation, live OCR validation on a scanned book, async extraction workers.
+- ⏳ **Phase 2 — Application assistance**: motivation email generator (E4), editable draft, LinkedIn variant, project bank, CV tailoring.
+- ⏳ **Phase 3 — Automation & trust**: OAuth send (Gmail/Outlook), review-and-approve, send log, multi-book per account.
+- ⏳ **Phase 4 — Scale**: usage caps, self-host docs, outcome tracking.
 
 ## Open decisions
 
-- Data handling for uploaded PFE books should be documented clearly in the README and terms: users upload for personal matching only.
-- French should be the primary language target for extraction prompts, with English as secondary.
-- The project should support a privacy-preserving local-only mode, even if a free-tier cloud mode is available as an optional quality upgrade.
+- Data handling for uploaded PFE books should be documented clearly (users upload for personal matching only).
+- French is the primary target language for extraction prompts, English secondary.
+- The project supports a privacy-preserving local-only mode, with free-tier cloud as an optional quality upgrade.
 
-## Next step
+## Current next steps
 
-The cleanest next implementation step is to scaffold the actual app and service boundaries around this spec: frontend, API, worker, and shared schema packages.
-
-The next implementation milestone is E1.1: upload a PDF, extract raw text, and add an OCR fallback behind the API and worker boundaries above. File-hash deduplication (E1.2) follows immediately after.
+1. **Ingestion observability** — per-book coverage log (source chars vs. extracted) + surface `quality_report` at index time.
+2. **Match ground truth** — a real CV fixture and precision@k measurement against the stored books before tuning.
+3. **AutoApply email MVP (E4)** — tailored motivation email with graceful personalization fallback while company mission/vision/values remain `null`.
