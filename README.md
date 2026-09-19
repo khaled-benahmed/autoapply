@@ -139,31 +139,25 @@ The system should support both self-hosted and free-tier cloud providers through
 - multilingual and lightweight enough for laptop use
 - can provide dense and sparse signals for hybrid search
 
-### NVIDIA NIM extraction
-
-The current extraction implementation uses NVIDIA NIM with `nvidia/nemotron-3.5-lightning-30b-a3b` for company context and subject segmentation. Subjects retain their complete `rawText`, title, and page range so embeddings and keyword search do not depend on perfect field classification. The extraction endpoint is called separately after upload:
-
-```powershell
-$env:NVIDIA_API_KEY = "your-key-from-build.nvidia.com"
-$env:NVIDIA_MODEL = "nvidia/nemotron-3.5-lightning-30b-a3b"
-$env:NVIDIA_TIMEOUT_SECONDS = "180"
-docker compose up --build
-```
-
-Then call `POST /books/{file_hash}/extract`. Do not commit API keys or place them in source files. NVIDIA model availability and rate limits can change over time.
-
 ### g4f extraction
 
-The API can use the community-maintained `g4f` client through its provider abstraction. It is selected by default for local experiments:
+The API uses the community-maintained `g4f` client through its provider abstraction. Extraction runs through an ordered provider cascade; each tier is tried in sequence until one returns valid extraction JSON:
+
+1. `Gemini` / `gemini-3.6-flash` (primary)
+2. `Cloudflare` / `glm-5.2`
+3. `Gemini` / `gemini-3.1-flash-lite`
+4. `LLM7` / `default` (final fallback)
+
+The cascade is configurable through the `G4F_PROVIDER_POOL` environment variable as a comma-separated `Provider:Model` list:
 
 ```powershell
-$env:EXTRACTION_PROVIDER = "g4f"
-$env:G4F_PROVIDER = "LLM7"
-$env:G4F_MODEL = "default"
+$env:G4F_PROVIDER_POOL = "Gemini:gemini-3.6-flash,Cloudflare:glm-5.2,Gemini:gemini-3.1-flash-lite,LLM7:default"
+$env:G4F_MAX_TOKENS = "8000"
+$env:G4F_CHUNK_CHARACTERS = "8000"
 docker compose up --build
 ```
 
-g4f routes requests through third-party providers whose availability, speed, login requirements, and terms can change. It may require browser automation or provider-specific cookies. The application still validates the returned text against the Pydantic extraction schema before saving it. To use NVIDIA instead, set `EXTRACTION_PROVIDER=nvidia` and provide `NVIDIA_API_KEY`.
+Then call `POST /books/{file_hash}/extract`. Each provider in the pool is retried twice; if the whole pool fails, the endpoint returns a 500 with the per-provider errors. The application validates the returned text against the Pydantic extraction schema before saving it.
 
 
 ## Core data model

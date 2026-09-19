@@ -41,16 +41,9 @@ services:
       - ./services/api:/app
     environment:
       DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL in .env}
-      EXTRACTION_PROVIDER: ${EXTRACTION_PROVIDER:-g4f}
-      G4F_PROVIDER: ${G4F_PROVIDER:-LLM7}
-      G4F_MODEL: ${G4F_MODEL:-default}
+      G4F_PROVIDER_POOL: ${G4F_PROVIDER_POOL:-Gemini:gemini-3.6-flash,Cloudflare:glm-5.2,Gemini:gemini-3.1-flash-lite,LLM7:default}
+      G4F_MAX_TOKENS: ${G4F_MAX_TOKENS:-8000}
       G4F_CHUNK_CHARACTERS: ${G4F_CHUNK_CHARACTERS:-8000}
-      NVIDIA_API_KEY: ${NVIDIA_API_KEY:-}
-      NVIDIA_MODEL: ${NVIDIA_MODEL:-nvidia/nemotron-3.5-lightning-30b-a3b}
-      NVIDIA_BASE_URL: ${NVIDIA_BASE_URL:-https://integrate.api.nvidia.com/v1}
-      NVIDIA_TIMEOUT_SECONDS: ${NVIDIA_TIMEOUT_SECONDS:-180}
-      NVIDIA_MAX_TOKENS: ${NVIDIA_MAX_TOKENS:-8000}
-      NVIDIA_MAX_RETRIES: ${NVIDIA_MAX_RETRIES:-0}
       STORAGE_ENDPOINT: http://minio:9000
       STORAGE_ACCESS_KEY: ${MINIO_ROOT_USER:?Set MINIO_ROOT_USER in .env}
       STORAGE_SECRET_KEY: ${MINIO_ROOT_PASSWORD:?Set MINIO_ROOT_PASSWORD in .env}
