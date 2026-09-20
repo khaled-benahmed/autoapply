@@ -118,7 +118,7 @@ flowchart TB
     GW --> OBJ
     GW -->|"index: build tsvector + pgvector rows"| PG
     GW -->|"hybrid search: keyword + dense, RRF"| PG
-    ```
+```
 
 Future (not yet built): async workers (Redis queue), LLM rerank, email generator, OAuth send, multi-user auth.
 
